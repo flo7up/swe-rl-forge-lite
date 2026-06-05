@@ -170,6 +170,10 @@ cython_debug/
 # Ruff stuff:
 .ruff_cache/
 
+# SWE RL Forge Lite generated artifacts
+.forge/
+taskpacks/
+
 # PyPI configuration file
 .pypirc
 

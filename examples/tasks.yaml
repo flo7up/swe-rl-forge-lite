@@ -1,0 +1,8 @@
+tasks:
+  - id: click-pr-001
+    repo_url: "https://github.com/pallets/click.git"
+    pr_number: 1
+    base_ref: null
+    test_command: "pytest"
+    language: "python"
+    timeout_seconds: 300
