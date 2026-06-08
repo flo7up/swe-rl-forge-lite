@@ -1,11 +1,42 @@
 # swe-rl-forge-lite
 
-`swe-rl-forge-lite` is a small, open-source framework for turning historical GitHub pull requests into reproducible software-engineering tasks for coding agents.
+Turn real bug-fix pull requests into reproducible coding-agent tasks.
 
-The project is intentionally modest: It is the first building block of a learning environment for SWE agents (coding LLMs). The learning process works as follows: create a task from a real fix, verify that the fix matters, package the environment, run a binary reward, and report whether the task is usable.
+`swe-rl-forge-lite` takes a merged GitHub PR, reconstructs the repository before the fix, checks that the historical patch applies, runs tests before and after the patch, packages the task, and emits a binary reward. The result is a local, inspectable taskpack that can be used for SWE-agent evaluation, reward design, and RL-style training loops.
 
-This approach is commonly used in coding-agent research. It allows you to turn real software changes into reliable training and evaluation units. Tasks come from actual merged PRs rather than synthetic examples. Success is grounded in executable evidence — before and after tests — not human opinion (more on the success metrics below).
-Dockerized runs and deterministic reruns reduce hidden environment drift. A strict quality gate labels each task as `usable`, `needs_review`, or `invalid`, so low-quality tasks do not silently contaminate datasets. The tool is lightweight and local-first, making it a practical building block for SWE benchmarking, reward design, and RL-style task generation.
+The project is intentionally modest: one local framework for creating trustworthy task units from real software changes. Success is grounded in executable evidence, not human opinion. Dockerized runs and deterministic reruns reduce hidden environment drift. A strict quality gate labels each task as `usable`, `needs_review`, or `invalid`, so weak tasks do not silently contaminate datasets.
+
+## What You Can Do With It
+
+- Build a small benchmark from real merged PRs instead of synthetic bugs.
+- Check whether a historical fix is actually test-verifiable before packaging it.
+- Generate self-contained `taskpacks/<task_id>/` folders with prompts, patches, Dockerfiles, verification metadata, and reward scripts.
+- Run a binary reward against a packaged task to score an agent's attempted fix.
+- Watch the pipeline live while tasks move from fetched to verified to packaged.
+
+## Fast Local Demo
+
+The repo ships with one sample task, `click-pr-001`, so you can exercise the pipeline without finding a new PR first.
+
+```bash
+pip install -e ".[dev]"
+forge fetch examples/tasks.yaml
+forge verify click-pr-001
+forge package click-pr-001
+forge dashboard-live --enable-controls --open
+```
+
+On Windows, `./start.ps1` opens the live React dashboard in a separate terminal, installs frontend dependencies if needed, and starts the local API with pipeline controls enabled.
+
+## Live Dashboard
+
+![Forge live dashboard overview](docs/images/live-dashboard-overview.png)
+
+The dashboard shows task status, quality checks, and packaging state as local artifacts appear.
+
+![Forge live dashboard pipeline controls](docs/images/live-dashboard-controls.png)
+
+Pipeline controls are opt-in on the CLI via `--enable-controls`. They only run named forge operations (`fetch`, `verify`, and `package`) against local task data; they do not expose arbitrary shell command execution.
 
 ## Project Flow
 
@@ -23,7 +54,7 @@ LLM training and evaluation for software engineering need environments where suc
 
 When those pieces are available, a pull request becomes more than an example diff. It becomes a verifiable environment: a prompt, a repository state, a known-good patch, a test command, a reward function, and a quality report. That is the unit this project is designed to produce.
 
-## How PR Quality Is Enforced
+## Why Trust The Task?
 
 `swe-rl-forge-lite` treats quality as an executable gate, not a heuristic score.
 
@@ -45,6 +76,8 @@ The final quality recommendation is rule-based:
 - `needs_review`: everything else.
 
 This keeps the source of truth grounded in reproducible execution rather than metadata, intuition, or LLM opinion.
+
+Every report keeps the failure reason visible. A task can fail because the base commit cannot be reconstructed, the patch does not apply, Docker cannot build the environment, the pre-patch tests do not fail, the post-patch tests do not pass, or the deterministic rerun drifts. Those distinctions matter when deciding whether a task belongs in an evaluation set.
 
 ## Features
 
@@ -168,7 +201,7 @@ forge dashboard-live --open
 For frontend development with hot reload:
 
 ```bash
-forge dashboard-live
+forge dashboard-live --enable-controls
 npm --prefix frontend run dev
 ```
 
@@ -182,6 +215,8 @@ npm --prefix frontend run dev
 ```
 
 For control buttons during frontend development, start the API with `forge dashboard-live --enable-controls` and set `FORGE_API_ORIGIN` to that server.
+
+On Windows, `./start.ps1` runs this local development setup in a separate terminal.
 
 You can also run the local demo script:
 
