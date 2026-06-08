@@ -3,6 +3,7 @@ tasks:
     repo_url: "https://github.com/pallets/click.git"
     pr_number: 1
     base_ref: null
-    test_command: "pytest"
+    test_command: >-
+      python -c "from pathlib import Path; text = Path('docs/setuptools.rst').read_text(encoding='utf-8'); assert 'wrapeprs' not in text; assert 'wrappers for Windows' in text"
     language: "python"
     timeout_seconds: 300

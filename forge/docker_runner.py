@@ -33,6 +33,7 @@ ENV PIP_NO_CACHE_DIR=1 \
     PYTHONUNBUFFERED=1
 COPY . /workspace
 RUN python -m pip install --upgrade pip
+RUN python -m pip install pytest
 RUN if [ -f pyproject.toml ] || [ -f setup.py ] || [ -f setup.cfg ]; then \
       pip install -e .; \
     elif [ -f requirements.txt ]; then \

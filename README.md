@@ -2,7 +2,10 @@
 
 `swe-rl-forge-lite` is a small, open-source framework for turning historical GitHub pull requests into reproducible software-engineering tasks for coding agents.
 
-The project is intentionally modest: it is not a training system, a benchmark leaderboard, or an agent rollout engine. It is the first building block of a tiny hill-climbing machine for SWE agents: create a task from a real fix, verify that the fix matters, package the environment, run a binary reward, and report whether the task is usable.
+The project is intentionally modest: It is the first building block of a learning environment for SWE agents (coding LLMs). The learning process works as follows: create a task from a real fix, verify that the fix matters, package the environment, run a binary reward, and report whether the task is usable.
+
+This approach is commonly used in coding-agent research. It allows you to turn real software changes into reliable training and evaluation units. Tasks come from actual merged PRs rather than synthetic examples. Success is grounded in executable evidence — before and after tests — not human opinion (more on the success metrics below).
+Dockerized runs and deterministic reruns reduce hidden environment drift. A strict quality gate labels each task as `usable`, `needs_review`, or `invalid`, so low-quality tasks do not silently contaminate datasets. The tool is lightweight and local-first, making it a practical building block for SWE benchmarking, reward design, and RL-style task generation.
 
 ## Project Flow
 
@@ -20,6 +23,29 @@ LLM training and evaluation for software engineering need environments where suc
 
 When those pieces are available, a pull request becomes more than an example diff. It becomes a verifiable environment: a prompt, a repository state, a known-good patch, a test command, a reward function, and a quality report. That is the unit this project is designed to produce.
 
+## How PR Quality Is Enforced
+
+`swe-rl-forge-lite` treats quality as an executable gate, not a heuristic score.
+
+For each candidate task, `forge verify` checks:
+
+- The repository can be reconstructed at the historical base commit.
+- The historical gold patch applies cleanly on that base commit.
+- Tests fail before the patch.
+- Tests pass after the patch.
+- A deterministic post-patch rerun also passes.
+- Docker builds and the test environment are healthy.
+
+The verifier also distinguishes product behavior from infrastructure failures (for example, missing test tooling or Docker build issues), and records those separately in verification output.
+
+The final quality recommendation is rule-based:
+
+- `invalid`: foundational checks fail (base commit, patch applicability, Docker build, or test environment).
+- `usable`: tests fail before, pass after, and deterministic rerun passes.
+- `needs_review`: everything else.
+
+This keeps the source of truth grounded in reproducible execution rather than metadata, intuition, or LLM opinion.
+
 ## Features
 
 - Ingest public GitHub pull requests without requiring a GitHub token.
@@ -31,6 +57,7 @@ When those pieces are available, a pull request becomes more than an example dif
 - Print a task quality report with a recommended status.
 - Explore public GitHub PRs and emit candidate task YAML for verification.
 - Generate a local static dashboard for observing task status and verification results.
+- Run a live dashboard API and React UI for near real-time process observation.
 
 ## Installation
 
@@ -118,6 +145,44 @@ forge dashboard
 
 Open `.forge/dashboard/index.html` in a browser to inspect fetched, verified, packaged, usable, needs-review, and invalid tasks.
 
+Run the live dashboard API server:
+
+```bash
+forge dashboard-live --open
+```
+
+Enable local run controls when you want the browser UI to launch verification and packaging jobs:
+
+```bash
+forge dashboard-live --enable-controls --open
+```
+
+Build and serve the React + Vite + Tailwind frontend through the same server:
+
+```bash
+npm --prefix frontend install
+npm --prefix frontend run build
+forge dashboard-live --open
+```
+
+For frontend development with hot reload:
+
+```bash
+forge dashboard-live
+npm --prefix frontend run dev
+```
+
+Then open `http://127.0.0.1:5173`.
+
+If the API server is on a non-default port, point the Vite proxy at it before starting the dev server:
+
+```powershell
+$env:FORGE_API_ORIGIN="http://127.0.0.1:8766"
+npm --prefix frontend run dev
+```
+
+For control buttons during frontend development, start the API with `forge dashboard-live --enable-controls` and set `FORGE_API_ORIGIN` to that server.
+
 You can also run the local demo script:
 
 ```powershell
@@ -149,6 +214,23 @@ Useful options:
 - `--timeout-seconds 300` to set the generated timeout.
 
 Exploration does not prove a task is usable. It narrows the search space; `forge verify` remains the gate that checks patch application, failing pre-patch tests, passing post-patch tests, Docker build success, and deterministic reruns.
+
+#### Default Candidate Scoring
+
+Each candidate is assigned a score between 0 and 1 based on the following heuristics, derived directly from the PR metadata:
+
+| Criterion | Score impact | What it checks | Why it matters |
+|---|---|---|---|
+| Merged PR | `+0.15` | PR was merged into the project | Weak quality signal. Maintainers likely reviewed and accepted the change. |
+| Bug/fix language | `+0.25` | Title/body contains words like `bug`, `fix`, `regression`, `failure`, `failing`, `broken` | Suggests the PR fixed a real defect, not just changed code. |
+| Test signal | `+0.20` | Title/body contains words like `test`, `pytest`, `unit test`, `regression test` | Increases chance that the task can be verified through executable tests. |
+| Small changed-file count | `+0.15` | PR changes 1 to 8 files | Keeps the task focused and easier to isolate. |
+| Large changed-file count | `-0.15` | PR changes more than 20 files | Large PRs are often noisy: refactors, migrations, generated code, or many unrelated changes. |
+| Moderate patch size | `+0.15` | Additions + deletions are between 1 and 500 lines | Indicates the fix is meaningful but still manageable. |
+| Large patch size | `-0.20` | Additions + deletions exceed 1500 lines | Too large for a clean SWE-agent task. Hard to attribute success to one focused fix. |
+| Documentation-only risk | `-0.15` | Title/body contains `docs`, `documentation`, `typo`, or `readme` | These PRs often lack failing tests and are weak for reward-based learning. |
+
+Scores are clamped to `[0.0, 1.0]`. Candidates are sorted by score descending before the `--limit` is applied. The score is advisory: a high score improves the odds of a task passing `forge verify`, but it is not a guarantee.
 
 An LLM can be useful in this discovery loop, but it should stay advisory. Good uses include reading PR titles/bodies/diffs to prioritize candidates, spotting likely documentation-only changes, suggesting a narrower test command, and explaining why a candidate may fail verification. The source of truth remains executable verification: patch application, Docker build, tests before/after, and deterministic reruns. To keep the MVP local and reproducible, `forge explore` does not require an LLM or any cloud service.
 
@@ -294,6 +376,36 @@ forge dashboard --output .forge/dashboard/index.html
 ```
 
 The dashboard is observational only. It reads metadata, verification results, patch presence, and taskpack presence, then renders summary counts, filters, quality checks, and recorded errors. It does not run tests or mutate repositories.
+
+### `forge dashboard-live`
+
+Starts a local HTTP server with a live JSON endpoint and optional static frontend hosting:
+
+```bash
+forge dashboard-live --host 127.0.0.1 --port 8765
+```
+
+- `GET /api/tasks` returns a snapshot with task rows and summary counters.
+- `GET /api/control/status` returns whether run controls are enabled and the latest control job.
+- `GET /health` returns a basic health payload.
+- If `frontend/dist` exists, the command also serves the React dashboard UI.
+
+By default, the live dashboard is read-only and refresh-safe. It continuously reflects current `.forge/tasks/*` and `taskpacks/*` artifacts without mutating task state.
+
+Run controls are available only when the server is started with `--enable-controls`:
+
+```bash
+forge dashboard-live --enable-controls
+```
+
+With controls enabled:
+
+- `POST /api/control/manual` verifies and packages one already-fetched task from a JSON body like `{"task_id":"click-pr-001"}`.
+- `POST /api/control/auto` runs a one-shot `fetch -> verify -> package` batch from a config body like `{"config_path":"examples/tasks.yaml"}`.
+- Only one control job can run at a time.
+- Invalid verification results are not packaged.
+
+Controls deliberately run named forge operations rather than arbitrary shell commands. Auto mode is a bounded batch run, not a continuous scheduler.
 
 ## Docker Execution
 

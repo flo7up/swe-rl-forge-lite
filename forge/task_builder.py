@@ -9,7 +9,7 @@ from forge.docker_runner import DockerRunResult, generate_python_dockerfile, run
 from forge.git_utils import GitCommandError, checkout_clean, clone_or_update, ensure_commit_available, fetch_ref, repo_has_commit, resolve_ref
 from forge.github_pr import fetch_pr_diff, fetch_pull_request
 from forge.patch_utils import apply_patch_file, check_patch
-from forge.task_schema import CommandRun, TaskMetadata, VerificationResult
+from forge.task_schema import CommandRun, TaskMetadata, VerificationResult, detect_test_infrastructure_failure
 
 
 FORGE_DIR = Path(".forge")
@@ -197,9 +197,22 @@ def verify_task(task_id: str, *, root: Path | None = None, log: LogFn = _noop_lo
 
     run_records = [run for run in (before_patch, after_patch, deterministic_rerun) if run is not None]
     docker_build_success = bool(run_records) and all(run.docker_build_success for run in run_records)
-    tests_fail_before_patch = before_patch is not None and before_patch.docker_build_success and before_patch.exit_code not in (None, 0)
-    tests_pass_after_patch = after_patch is not None and after_patch.docker_build_success and after_patch.exit_code == 0
-    deterministic_rerun_success = deterministic_rerun is not None and deterministic_rerun.docker_build_success and deterministic_rerun.exit_code == 0
+    infrastructure_failures = [
+        f"{run.phase}: {reason}"
+        for run in run_records
+        if (reason := detect_test_infrastructure_failure(run)) is not None
+    ]
+    for failure in infrastructure_failures:
+        errors.append(f"Test infrastructure failure: {failure}")
+    test_environment_success = not infrastructure_failures
+    tests_fail_before_patch = (
+        before_patch is not None
+        and test_environment_success
+        and before_patch.docker_build_success
+        and before_patch.exit_code not in (None, 0)
+    )
+    tests_pass_after_patch = after_patch is not None and test_environment_success and after_patch.docker_build_success and after_patch.exit_code == 0
+    deterministic_rerun_success = deterministic_rerun is not None and test_environment_success and deterministic_rerun.docker_build_success and deterministic_rerun.exit_code == 0
 
     verification = VerificationResult(
         task_id=task_id,
@@ -208,6 +221,7 @@ def verify_task(task_id: str, *, root: Path | None = None, log: LogFn = _noop_lo
         tests_fail_before_patch=tests_fail_before_patch,
         tests_pass_after_patch=tests_pass_after_patch,
         docker_build_success=docker_build_success,
+        test_environment_success=test_environment_success,
         deterministic_rerun_success=deterministic_rerun_success,
         before_patch=before_patch,
         after_patch=after_patch,

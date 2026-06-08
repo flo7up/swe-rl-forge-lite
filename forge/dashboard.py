@@ -180,7 +180,7 @@ select {{ flex: 0 1 200px; }}
 .usable {{ color: var(--cp-success); border-color: var(--cp-success); }}
 .needs_review, .unverified {{ color: var(--cp-warning); border-color: var(--cp-warning); }}
 .invalid {{ color: var(--cp-danger); border-color: var(--cp-danger); }}
-.checks {{ display: grid; grid-template-columns: repeat(6, minmax(120px, 1fr)); gap: 8px; margin-top: 14px; }}
+.checks {{ display: grid; grid-template-columns: repeat(7, minmax(120px, 1fr)); gap: 8px; margin-top: 14px; }}
 .check {{ border: 1px solid var(--cp-border); border-radius: 0.625rem; padding: 10px; background: var(--cp-surface-soft); }}
 .check b {{ display: block; font-size: 0.78rem; color: var(--cp-text-muted); margin-bottom: 6px; }}
 .yes {{ color: var(--cp-success); }}
@@ -269,6 +269,7 @@ pre {{ overflow: auto; white-space: pre-wrap; border: 1px solid var(--cp-border)
           ${{check("passes after", checks.tests_pass_after_patch)}}
           ${{check("rerun", checks.deterministic_rerun_success)}}
           ${{check("docker", checks.docker_build_success)}}
+          ${{check("test env", checks.test_environment_success)}}
         </div>
         <details>
           <summary>Details</summary>
@@ -318,6 +319,7 @@ def _dashboard_task(root: Path, metadata: TaskMetadata, verification: Verificati
         "tests_fail_before_patch": None,
         "tests_pass_after_patch": None,
         "docker_build_success": None,
+        "test_environment_success": None,
         "deterministic_rerun_success": None,
     }
     errors: list[str] = []
@@ -333,6 +335,7 @@ def _dashboard_task(root: Path, metadata: TaskMetadata, verification: Verificati
             "tests_fail_before_patch": verification.tests_fail_before_patch,
             "tests_pass_after_patch": verification.tests_pass_after_patch,
             "docker_build_success": verification.docker_build_success,
+            "test_environment_success": verification.test_environment_success,
             "deterministic_rerun_success": verification.deterministic_rerun_success,
         }
         errors = verification.errors

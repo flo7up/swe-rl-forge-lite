@@ -8,6 +8,7 @@ from rich.console import Console
 from rich.table import Table
 
 from forge.dashboard import DEFAULT_DASHBOARD_PATH, write_dashboard
+from forge.dashboard_live import DEFAULT_CONTROL_CONFIG, DEFAULT_FRONTEND_DIST, DEFAULT_LIVE_HOST, DEFAULT_LIVE_PORT, serve_live_dashboard
 from forge.explorer import DEFAULT_EXPLORE_QUERY, explore_github_prs, write_candidates_yaml
 from forge.llm_review import DEFAULT_ENV_FILE, describe_llm_config, resolve_llm_config, review_exploration_candidates
 from forge.quality_report import build_quality_report, render_quality_report
@@ -194,6 +195,30 @@ def dashboard_command(
     except Exception as exc:  # noqa: BLE001
         _die(exc)
     console.print(f"Generated dashboard: [green]{dashboard_path}[/green]")
+
+
+@app.command("dashboard-live")
+def dashboard_live_command(
+    host: str = typer.Option(DEFAULT_LIVE_HOST, "--host", help="Host interface for the live dashboard API/server."),
+    port: int = typer.Option(DEFAULT_LIVE_PORT, "--port", min=1, max=65535, help="Port for the live dashboard API/server."),
+    static_dir: Path = typer.Option(
+        DEFAULT_FRONTEND_DIST,
+        "--static-dir",
+        help="Directory to serve static frontend assets from (typically frontend/dist).",
+    ),
+    open_browser: bool = typer.Option(False, "--open", help="Open the live dashboard in your browser after server start."),
+    enable_controls: bool = typer.Option(False, "--enable-controls", help="Enable local dashboard buttons that run verify/package jobs."),
+) -> None:
+    """Serve a live JSON API and optional static frontend for real-time task observation."""
+
+    try:
+        console.print(f"Starting live dashboard at [green]http://{host}:{port}[/green]")
+        console.print("API endpoint: [cyan]/api/tasks[/cyan]")
+        if enable_controls:
+            console.print(f"Controls enabled. Auto mode defaults to [cyan]{DEFAULT_CONTROL_CONFIG}[/cyan].")
+        serve_live_dashboard(host=host, port=port, static_dir=static_dir, open_browser=open_browser, controls_enabled=enable_controls)
+    except Exception as exc:  # noqa: BLE001
+        _die(exc)
 
 
 if __name__ == "__main__":

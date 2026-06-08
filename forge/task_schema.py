@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def utc_now() -> datetime:
@@ -67,6 +67,19 @@ class CommandRun(BaseModel):
     duration_seconds: float = 0.0
 
 
+def detect_test_infrastructure_failure(run: CommandRun) -> str | None:
+    output = f"{run.stderr}\n{run.stdout}\n{run.error or ''}".lower()
+    if not run.docker_build_success:
+        return run.error or "Docker image build failed"
+    if run.exit_code == 127 or "command not found" in output:
+        return f"test command could not be found: {run.command}"
+    if "not recognized as an internal or external command" in output:
+        return f"test command could not be found: {run.command}"
+    if "no module named pytest" in output or "no module named 'pytest'" in output:
+        return "pytest is not installed in the test environment"
+    return None
+
+
 class VerificationResult(BaseModel):
     """Quality and verification result for a forged task."""
 
@@ -78,12 +91,31 @@ class VerificationResult(BaseModel):
     tests_fail_before_patch: bool = False
     tests_pass_after_patch: bool = False
     docker_build_success: bool = False
+    test_environment_success: bool = True
     deterministic_rerun_success: bool = False
     before_patch: CommandRun | None = None
     after_patch: CommandRun | None = None
     deterministic_rerun: CommandRun | None = None
     errors: list[str] = Field(default_factory=list)
     verified_at: datetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="after")
+    def derive_test_environment_status(self) -> "VerificationResult":
+        runs = [run for run in (self.before_patch, self.after_patch, self.deterministic_rerun) if run is not None]
+        infrastructure_failures = [
+            f"Test infrastructure failure: {run.phase}: {reason}"
+            for run in runs
+            if (reason := detect_test_infrastructure_failure(run)) is not None
+        ]
+        if infrastructure_failures:
+            self.test_environment_success = False
+            self.tests_fail_before_patch = False
+            self.tests_pass_after_patch = False
+            self.deterministic_rerun_success = False
+            for failure in infrastructure_failures:
+                if failure not in self.errors:
+                    self.errors.append(failure)
+        return self
 
     def write_json(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

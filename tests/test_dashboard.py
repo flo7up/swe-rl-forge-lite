@@ -44,6 +44,7 @@ def test_collect_dashboard_tasks_reads_local_artifacts(tmp_path: Path) -> None:
     assert len(tasks) == 1
     assert tasks[0].recommended_status == "usable"
     assert tasks[0].lifecycle_stage == "packaged"
+    assert tasks[0].checks["test_environment_success"] is True
     assert tasks[0].checks["tests_pass_after_patch"] is True
 
 
@@ -53,6 +54,7 @@ def test_render_dashboard_html_contains_theme_and_data(tmp_path: Path) -> None:
     assert "clawpilotTheme" in html
     assert "--cp-bg: #f7f4ef;" in html
     assert "Local task forge observer" in html
+    assert "test env" in html
 
     output = write_dashboard(tmp_path / "dashboard.html", root=tmp_path)
     assert output.exists()

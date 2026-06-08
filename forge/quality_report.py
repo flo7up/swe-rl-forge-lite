@@ -11,7 +11,12 @@ from forge.task_schema import VerificationResult
 
 
 def recommend_status(verification: VerificationResult) -> str:
-    if not verification.base_commit_found or not verification.patch_applies or not verification.docker_build_success:
+    if (
+        not verification.base_commit_found
+        or not verification.patch_applies
+        or not verification.docker_build_success
+        or not verification.test_environment_success
+    ):
         return "invalid"
     if (
         verification.tests_fail_before_patch
@@ -39,6 +44,7 @@ def build_quality_report(task_id: str, *, root: Path | None = None) -> dict[str,
         "tests_pass_after_patch": verification.tests_pass_after_patch,
         "deterministic_rerun_success": verification.deterministic_rerun_success,
         "environment_build_status": verification.docker_build_success,
+        "test_environment_status": verification.test_environment_success,
         "recommended_status": recommend_status(verification),
         "errors": verification.errors,
     }
@@ -57,6 +63,7 @@ def render_quality_report(console: Console, report: dict[str, Any]) -> None:
         ("Tests pass after patch", _status(report["tests_pass_after_patch"])),
         ("Deterministic rerun", _status(report["deterministic_rerun_success"])),
         ("Environment build", _status(report["environment_build_status"])),
+        ("Test environment", _status(report["test_environment_status"])),
         ("Recommended status", report["recommended_status"]),
     ]
     for name, status in checks:
