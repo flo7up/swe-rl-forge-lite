@@ -31,6 +31,24 @@ class ControlBusyError(RuntimeError):
 
 
 @dataclass
+class ControlQueueItem:
+    task_id: str
+    status: str
+    repo_name: str = ""
+    pr_number: int | None = None
+    pr_title: str = ""
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "status": self.status,
+            "repo_name": self.repo_name,
+            "pr_number": self.pr_number,
+            "pr_title": self.pr_title,
+        }
+
+
+@dataclass
 class ControlJob:
     id: str
     mode: str
@@ -41,6 +59,7 @@ class ControlJob:
     config_path: str | None = None
     error: str | None = None
     logs: list[str] = field(default_factory=list)
+    queue: list[ControlQueueItem] = field(default_factory=list)
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -53,6 +72,7 @@ class ControlJob:
             "config_path": self.config_path,
             "error": self.error,
             "logs": list(self.logs),
+            "queue": [item.to_payload() for item in self.queue],
         }
 
 
@@ -85,6 +105,7 @@ class DashboardControlRunner:
             status="running",
             started_at=_now_iso(),
             task_id=resolved_task_id,
+            queue=[ControlQueueItem(task_id=resolved_task_id, status="queued")],
         )
         return self._start_job(job, lambda: self._run_task(job, resolved_task_id))
 
@@ -125,21 +146,41 @@ class DashboardControlRunner:
             self._append_log(job, "No tasks were found in the config.")
             return
 
+        self._set_queue(job, [_queue_item_from_metadata(metadata) for metadata in metadata_items])
         for metadata in metadata_items:
             self._run_task(job, metadata.id)
 
     def _run_task(self, job: ControlJob, task_id: str) -> None:
-        self._append_log(job, f"Verifying {task_id}")
-        verification = verify_task(task_id, root=self.root, log=lambda message: self._append_log(job, message))
-        status = recommend_status(verification)
-        self._append_log(job, f"Verification status for {task_id}: {status}")
-        if status == "invalid":
-            self._append_log(job, f"Skipping package for {task_id} because verification is invalid.")
-            return
+        self._update_queue_item(job, task_id, "running")
+        try:
+            self._append_log(job, f"Verifying {task_id}")
+            verification = verify_task(task_id, root=self.root, log=lambda message: self._append_log(job, message))
+            status = recommend_status(verification)
+            self._append_log(job, f"Verification status for {task_id}: {status}")
+            if status == "invalid":
+                self._append_log(job, f"Skipping package for {task_id} because verification is invalid.")
+                self._update_queue_item(job, task_id, "skipped")
+                return
 
-        self._append_log(job, f"Packaging {task_id}")
-        package_dir = package_task(task_id, root=self.root, log=lambda message: self._append_log(job, message))
-        self._append_log(job, f"Packaged {task_id} at {_display_path(self.root, package_dir)}")
+            self._append_log(job, f"Packaging {task_id}")
+            package_dir = package_task(task_id, root=self.root, log=lambda message: self._append_log(job, message))
+            self._append_log(job, f"Packaged {task_id} at {_display_path(self.root, package_dir)}")
+            self._update_queue_item(job, task_id, "packaged")
+        except Exception:
+            self._update_queue_item(job, task_id, "failed")
+            raise
+
+    def _set_queue(self, job: ControlJob, queue: list[ControlQueueItem]) -> None:
+        with self._lock:
+            job.queue = queue
+
+    def _update_queue_item(self, job: ControlJob, task_id: str, status: str) -> None:
+        with self._lock:
+            for item in job.queue:
+                if item.task_id == task_id:
+                    item.status = status
+                    return
+            job.queue.append(ControlQueueItem(task_id=task_id, status=status))
 
     def _append_log(self, job: ControlJob, message: str) -> None:
         with self._lock:
@@ -155,6 +196,16 @@ class DashboardControlRunner:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _queue_item_from_metadata(metadata: Any) -> ControlQueueItem:
+    return ControlQueueItem(
+        task_id=str(metadata.id),
+        status="queued",
+        repo_name=str(getattr(metadata, "repo_name", "")),
+        pr_number=getattr(metadata, "pr_number", None),
+        pr_title=str(getattr(metadata, "pr_title", "")),
+    )
 
 
 def _validate_task_id(task_id: str) -> str:

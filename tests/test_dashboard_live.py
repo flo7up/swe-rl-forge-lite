@@ -17,7 +17,7 @@ def test_build_dashboard_snapshot_includes_summary_and_tasks(tmp_path: Path) -> 
         pr_number=11,
         repo_name="example/project",
         pr_title="Fix timeout edge case",
-        pr_body="",
+        pr_body="Describe the timeout fix.",
         base_commit="abcdef123456",
         head_commit="123456abcdef",
         test_command="pytest",
@@ -46,6 +46,10 @@ def test_build_dashboard_snapshot_includes_summary_and_tasks(tmp_path: Path) -> 
     assert snapshot["summary"]["usable"] == 1
     assert len(snapshot["tasks"]) == 1
     assert snapshot["tasks"][0]["id"] == task_id
+    assert snapshot["tasks"][0]["pr_body"] == "Describe the timeout fix."
+    assert snapshot["tasks"][0]["repo_kind"] == "Python repository"
+    assert snapshot["tasks"][0]["changed_files"] == ["x"]
+    assert snapshot["tasks"][0]["taskpack_files"] == []
     assert "generated_at" in snapshot
 
 
@@ -89,6 +93,9 @@ def test_control_runner_manual_verifies_and_packages(monkeypatch, tmp_path: Path
 
     snapshot = runner.snapshot()
     assert snapshot["job"]["status"] == "succeeded"
+    assert snapshot["job"]["queue"] == [
+        {"task_id": "live-001", "status": "packaged", "repo_name": "", "pr_number": None, "pr_title": ""}
+    ]
     assert calls == [("verify", "live-001"), ("package", "live-001")]
     assert any("verification log" in entry for entry in snapshot["job"]["logs"])
 
@@ -114,6 +121,9 @@ def test_control_runner_skips_package_for_invalid_task(monkeypatch, tmp_path: Pa
 
     snapshot = runner.snapshot()
     assert snapshot["job"]["status"] == "succeeded"
+    assert snapshot["job"]["queue"] == [
+        {"task_id": "live-001", "status": "skipped", "repo_name": "", "pr_number": None, "pr_title": ""}
+    ]
     assert calls == [("verify", "live-001")]
     assert any("Skipping package" in entry for entry in snapshot["job"]["logs"])
 
@@ -124,12 +134,15 @@ def test_control_runner_auto_fetches_then_runs_each_task(monkeypatch, tmp_path: 
     calls: list[tuple[str, str]] = []
 
     class Metadata:
-        def __init__(self, task_id: str) -> None:
+        def __init__(self, task_id: str, repo_name: str, pr_number: int, pr_title: str) -> None:
             self.id = task_id
+            self.repo_name = repo_name
+            self.pr_number = pr_number
+            self.pr_title = pr_title
 
     def fake_fetch(path: Path, *, root: Path | None = None, log=None) -> list[Metadata]:
         calls.append(("fetch", path.name))
-        return [Metadata("one"), Metadata("two")]
+        return [Metadata("one", "example/one", 1, "Fix one"), Metadata("two", "example/two", 2, "Fix two")]
 
     def fake_verify(task_id: str, *, root: Path | None = None, log=None) -> VerificationResult:
         calls.append(("verify", task_id))
@@ -152,6 +165,10 @@ def test_control_runner_auto_fetches_then_runs_each_task(monkeypatch, tmp_path: 
 
     snapshot = runner.snapshot()
     assert snapshot["job"]["status"] == "succeeded"
+    assert snapshot["job"]["queue"] == [
+        {"task_id": "one", "status": "packaged", "repo_name": "example/one", "pr_number": 1, "pr_title": "Fix one"},
+        {"task_id": "two", "status": "packaged", "repo_name": "example/two", "pr_number": 2, "pr_title": "Fix two"},
+    ]
     assert calls == [
         ("fetch", "tasks.yaml"),
         ("verify", "one"),

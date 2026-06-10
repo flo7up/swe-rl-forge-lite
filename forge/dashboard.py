@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import html
 import json
+import subprocess
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from forge.quality_report import recommend_status
-from forge.task_builder import TASKPACKS_DIR, TASKS_DIR, gold_patch_path, verification_path
+from forge.task_builder import REPOS_DIR, TASKPACKS_DIR, TASKS_DIR, gold_patch_path, verification_path
 from forge.task_schema import TaskMetadata, VerificationResult
 
 
@@ -26,6 +28,14 @@ class DashboardTask(BaseModel):
     repo_url: str
     pr_number: int
     pr_title: str
+    pr_body: str
+    repo_kind: str
+    changed_files: list[str] = Field(default_factory=list)
+    patch_additions: int = 0
+    patch_deletions: int = 0
+    patch_line_count: int = 0
+    head_commit_subject: str | None = None
+    head_commit_body: str | None = None
     test_command: str
     language: str
     timeout_seconds: int
@@ -35,6 +45,9 @@ class DashboardTask(BaseModel):
     has_patch: bool
     has_verification: bool
     has_taskpack: bool
+    taskpack_path: str | None = None
+    taskpack_files: list[str] = Field(default_factory=list)
+    taskpack_repo_file_count: int | None = None
     lifecycle_stage: str
     recommended_status: str
     checks: dict[str, bool | None] = Field(default_factory=dict)
@@ -310,9 +323,12 @@ def _read_verification(root: Path, task_id: str) -> VerificationResult | None:
 
 def _dashboard_task(root: Path, metadata: TaskMetadata, verification: VerificationResult | None) -> DashboardTask:
     has_verification = verification is not None
-    has_taskpack = (root / TASKPACKS_DIR / metadata.id).exists()
+    taskpack_dir = root / TASKPACKS_DIR / metadata.id
+    has_taskpack = taskpack_dir.exists()
     lifecycle_stage = "packaged" if has_taskpack else "verified" if has_verification else "fetched"
     status = recommend_status(verification) if verification else "unverified"
+    head_commit_subject, head_commit_body = _read_commit_message(root, metadata)
+    patch_stats = _patch_stats(root, metadata.id)
     checks: dict[str, bool | None] = {
         "base_commit_found": None,
         "patch_applies": None,
@@ -351,6 +367,14 @@ def _dashboard_task(root: Path, metadata: TaskMetadata, verification: Verificati
         repo_url=metadata.repo_url,
         pr_number=metadata.pr_number,
         pr_title=metadata.pr_title,
+        pr_body=metadata.pr_body,
+        repo_kind=_detect_repo_kind(root, metadata.id, metadata.language),
+        changed_files=patch_stats["changed_files"],
+        patch_additions=patch_stats["additions"],
+        patch_deletions=patch_stats["deletions"],
+        patch_line_count=patch_stats["line_count"],
+        head_commit_subject=head_commit_subject,
+        head_commit_body=head_commit_body,
         test_command=metadata.test_command,
         language=metadata.language,
         timeout_seconds=metadata.timeout_seconds,
@@ -360,9 +384,125 @@ def _dashboard_task(root: Path, metadata: TaskMetadata, verification: Verificati
         has_patch=gold_patch_path(root, metadata.id).exists(),
         has_verification=has_verification,
         has_taskpack=has_taskpack,
+        taskpack_path=_display_path(root, taskpack_dir) if has_taskpack else None,
+        taskpack_files=_taskpack_files(taskpack_dir) if has_taskpack else [],
+        taskpack_repo_file_count=_taskpack_repo_file_count(taskpack_dir) if has_taskpack else None,
         lifecycle_stage=lifecycle_stage,
         recommended_status=status,
         checks=checks,
         errors=errors,
         run_durations=durations,
     )
+
+
+def _patch_stats(root: Path, task_id: str) -> dict[str, Any]:
+    patch_path = gold_patch_path(root, task_id)
+    if not patch_path.exists():
+        return {"changed_files": [], "additions": 0, "deletions": 0, "line_count": 0}
+
+    files: list[str] = []
+    additions = 0
+    deletions = 0
+    line_count = 0
+    for line in patch_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line_count += 1
+        if line.startswith("diff --git "):
+            parts = line.split()
+            if len(parts) >= 4:
+                path = parts[3]
+                if path.startswith("b/"):
+                    path = path[2:]
+                if path not in files:
+                    files.append(path)
+        elif line.startswith("+") and not line.startswith("+++"):
+            additions += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            deletions += 1
+    return {"changed_files": files, "additions": additions, "deletions": deletions, "line_count": line_count}
+
+
+def _detect_repo_kind(root: Path, task_id: str, language: str) -> str:
+    repo_dir = _repo_snapshot_dir(root, task_id)
+    if repo_dir is None:
+        return f"{language.title()} repository" if language else "Repository"
+
+    if any((repo_dir / name).exists() for name in ("pyproject.toml", "setup.py", "setup.cfg")):
+        return "Python package"
+    if (repo_dir / "package.json").exists():
+        return "Node package"
+    if (repo_dir / "go.mod").exists():
+        return "Go module"
+    if (repo_dir / "Cargo.toml").exists():
+        return "Rust crate"
+    if any((repo_dir / name).exists() for name in ("pom.xml", "build.gradle", "build.gradle.kts")):
+        return "Java project"
+    return f"{language.title()} repository" if language else "Repository"
+
+
+def _repo_snapshot_dir(root: Path, task_id: str) -> Path | None:
+    packaged_repo = root / TASKPACKS_DIR / task_id / "repo"
+    if packaged_repo.exists():
+        return packaged_repo
+    fetched_repo = root / REPOS_DIR / task_id
+    if fetched_repo.exists():
+        return fetched_repo
+    return None
+
+
+def _read_commit_message(root: Path, metadata: TaskMetadata) -> tuple[str | None, str | None]:
+    repo_dir = root / REPOS_DIR / metadata.id
+    if not repo_dir.exists():
+        return None, None
+
+    return _cached_commit_message(str(repo_dir.resolve()), metadata.head_commit)
+
+
+@lru_cache(maxsize=512)
+def _cached_commit_message(repo_dir: str, commit: str) -> tuple[str | None, str | None]:
+    """Read an immutable commit message without running git on every live dashboard poll."""
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", repo_dir, "show", "-s", "--format=%s%n%b", commit],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None, None
+    if result.returncode != 0:
+        return None, None
+
+    lines = result.stdout.strip().splitlines()
+    if not lines:
+        return None, None
+    subject = lines[0].strip() or None
+    body = "\n".join(lines[1:]).strip() or None
+    return subject, body
+
+
+def _display_path(root: Path, path: Path) -> str:
+    try:
+        relative_path = path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return str(path)
+    return relative_path.as_posix()
+
+
+def _taskpack_files(taskpack_dir: Path) -> list[str]:
+    if not taskpack_dir.exists():
+        return []
+    files: list[str] = []
+    for child in sorted(taskpack_dir.iterdir(), key=lambda item: item.name.lower()):
+        suffix = "/" if child.is_dir() else ""
+        files.append(f"{child.name}{suffix}")
+    return files
+
+
+def _taskpack_repo_file_count(taskpack_dir: Path) -> int | None:
+  repo_dir = taskpack_dir / "repo"
+  if not repo_dir.exists():
+    return None
+  return sum(1 for child in repo_dir.rglob("*") if child.is_file())

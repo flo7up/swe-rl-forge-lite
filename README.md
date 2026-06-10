@@ -1,10 +1,12 @@
 # swe-rl-forge-lite
 
-Turn real bug-fix pull requests into reproducible coding-agent tasks.
+Turn real bug-fix pull requests into reproducible, reward-bearing coding-agent tasks.
 
-`swe-rl-forge-lite` takes a merged GitHub PR, reconstructs the repository before the fix, checks that the historical patch applies, runs tests before and after the patch, packages the task, and emits a binary reward. The result is a local, inspectable taskpack that can be used for SWE-agent evaluation, reward design, and RL-style training loops.
+`swe-rl-forge-lite` is a local pipeline that converts a merged GitHub pull request into a self-contained, executable task unit. Given a repository URL and a PR number, it reconstructs the repository exactly as it looked *before* the fix, confirms the historical patch still applies, runs the project's tests both before and after the patch inside Docker, repeats the post-patch run to check for non-determinism, and packages everything into an inspectable `taskpacks/<task_id>/` folder. Each package ships with a prompt, the pre-fix repository snapshot, the known-good ("gold") patch, a Dockerfile, a standalone reward script, the full verification record, and a rule-based quality verdict.
 
-The project is intentionally modest: one local framework for creating trustworthy task units from real software changes. Success is grounded in executable evidence, not human opinion. Dockerized runs and deterministic reruns reduce hidden environment drift. A strict quality gate labels each task as `usable`, `needs_review`, or `invalid`, so weak tasks do not silently contaminate datasets.
+The result is a *verifiable environment* rather than a static example diff: a prompt, a known repository state, a test command, a reproducible reward function, and a quality report. Those units can drive SWE-agent evaluation, reward design, curriculum building, and RL-style training loops where success must be grounded in executable evidence instead of human opinion or model preference.
+
+The project is intentionally focused and fully local. There is no cloud dependency for the core pipeline. Dockerized runs and deterministic reruns reduce hidden environment drift, and a strict quality gate labels every task as `usable`, `needs_review`, or `invalid`, so weak or unreproducible tasks never silently contaminate a dataset. An optional, advisory LLM step can help triage which PRs are worth verifying, but it never decides reward or validity — `forge verify` remains the only source of truth.
 
 ## What You Can Do With It
 
@@ -13,6 +15,26 @@ The project is intentionally modest: one local framework for creating trustworth
 - Generate self-contained `taskpacks/<task_id>/` folders with prompts, patches, Dockerfiles, verification metadata, and reward scripts.
 - Run a binary reward against a packaged task to score an agent's attempted fix.
 - Watch the pipeline live while tasks move from fetched to verified to packaged.
+
+## How It Works
+
+The pipeline is a small set of composable commands, each writing inspectable artifacts to disk so any stage can be re-run or audited independently.
+
+```text
+  explore            fetch                verify                  package            reward / report
+  (optional)         clone repo @ base    docker test BEFORE      taskpack/<id>/     binary score +
+  rank PR            + PR metadata        apply gold patch        prompt, repo,      quality verdict
+  candidates  ─────▶ + gold.patch  ─────▶ docker test AFTER ────▶ Dockerfile,  ────▶ usable /
+                                          deterministic rerun     reward.py,         needs_review /
+                                          quality gate            verification       invalid
+```
+
+1. **Explore (optional).** Search public GitHub PRs heuristically for likely bug-fix candidates and emit a YAML config. An optional LLM pass can rerank them, but it stays advisory.
+2. **Fetch.** Clone the repository, download PR metadata from the public GitHub API, resolve the base and head commits, and save the ground-truth `gold.patch` under `.forge/tasks/<task_id>/`.
+3. **Verify.** Check out the base commit, confirm the gold patch applies, run the configured test command in Docker *before* the patch (expecting failure), apply the patch and run again (expecting success), then run a second post-patch pass to catch non-deterministic tests. Infrastructure failures (e.g. Docker build or missing test tooling) are recorded separately from product behavior.
+4. **Package.** Emit a portable `taskpacks/<task_id>/` folder containing the prompt, the pre-fix repository snapshot, the gold patch, a generated Dockerfile, a standalone `reward.py`, and the verification record.
+5. **Reward & Report.** Score an agent's candidate fix with a binary, test-based reward, and print a compact quality report with the recommended status.
+6. **Observe.** A static or live dashboard surfaces task status, quality checks, packaging state, and a searchable training-package inventory while the pipeline runs.
 
 ## Fast Local Demo
 
@@ -26,17 +48,22 @@ forge package click-pr-001
 forge dashboard-live --enable-controls --open
 ```
 
-On Windows, `./start.ps1` opens the live React dashboard in a separate terminal, installs frontend dependencies if needed, and starts the local API with pipeline controls enabled.
+On Windows, `./start.ps1` opens the live React dashboard in a separate terminal, starts Docker Desktop if the Docker engine is not running, installs frontend dependencies if needed, and starts the local API with pipeline controls enabled.
 
 ## Live Dashboard
 
 ![Forge live dashboard overview](docs/images/live-dashboard-overview.png)
 
-The dashboard shows task status, quality checks, and packaging state as local artifacts appear.
+The React dashboard is a near real-time observer of the pipeline. From top to bottom it shows:
+
+- **Summary counters** for total, usable, needs-review, invalid, and unverified tasks.
+- **Pipeline controls** (opt-in) with a streaming run log that traces each verification step — base checkout, patch application, before/after test runs, and the deterministic rerun.
+- **Training package inventory**: a searchable table of emitted taskpacks with their quality verdict, complexity estimate, average patch size, average verification time, and bundled artifacts (`Dockerfile`, `gold.patch`, `prompt.md`, `repo/`, `reward.py`, `task.json`, `verification.json`).
+- **Per-task quality cards** that break down every gate — base commit found, patch applies, tests fail before, tests pass after, deterministic rerun, Docker build, and test environment — alongside repository, pull-request, and packaging metadata.
 
 ![Forge live dashboard pipeline controls](docs/images/live-dashboard-controls.png)
 
-Pipeline controls are opt-in on the CLI via `--enable-controls`. They only run named forge operations (`fetch`, `verify`, and `package`) against local task data; they do not expose arbitrary shell command execution.
+Pipeline controls are opt-in on the CLI via `--enable-controls`. They only run named forge operations (`fetch`, `verify`, and `package`) against local task data; they do not expose arbitrary shell command execution. By default the dashboard is read-only and refresh-safe.
 
 ## Project Flow
 
@@ -216,7 +243,7 @@ npm --prefix frontend run dev
 
 For control buttons during frontend development, start the API with `forge dashboard-live --enable-controls` and set `FORGE_API_ORIGIN` to that server.
 
-On Windows, `./start.ps1` runs this local development setup in a separate terminal.
+On Windows, `./start.ps1` runs this local development setup in a separate terminal and starts Docker Desktop first if the Docker engine is not running.
 
 You can also run the local demo script:
 
@@ -437,6 +464,7 @@ With controls enabled:
 
 - `POST /api/control/manual` verifies and packages one already-fetched task from a JSON body like `{"task_id":"click-pr-001"}`.
 - `POST /api/control/auto` runs a one-shot `fetch -> verify -> package` batch from a config body like `{"config_path":"examples/tasks.yaml"}`.
+- Auto mode exposes a run queue in the live dashboard so each configured repo/PR can be tracked as queued, running, packaged, skipped, or failed.
 - Only one control job can run at a time.
 - Invalid verification results are not packaged.
 

@@ -27,6 +27,83 @@ function Start-InExternalTerminal {
     }
 }
 
+function Test-DockerEngineReady {
+    if (-not (Test-CommandExists -Name "docker")) {
+        return $false
+    }
+
+    try {
+        docker info *> $null
+        return $LASTEXITCODE -eq 0
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-DockerDesktopPath {
+    $Candidates = @()
+    if ($env:ProgramFiles) {
+        $Candidates += Join-Path $env:ProgramFiles "Docker\Docker\Docker Desktop.exe"
+    }
+    if ($env:LOCALAPPDATA) {
+        $Candidates += Join-Path $env:LOCALAPPDATA "Programs\Docker\Docker\Docker Desktop.exe"
+    }
+
+    foreach ($Candidate in $Candidates) {
+        if (Test-Path -LiteralPath $Candidate) {
+            return $Candidate
+        }
+    }
+
+    return $null
+}
+
+function Start-DockerEngine {
+    if (-not (Test-CommandExists -Name "docker")) {
+        Write-Error "'docker' was not found on PATH. Install Docker Desktop and retry."
+    }
+
+    Write-Host "Docker engine is not running; starting Docker Desktop..." -ForegroundColor Cyan
+
+    try {
+        docker desktop start *> $null
+        if ($LASTEXITCODE -eq 0) {
+            return
+        }
+    }
+    catch {
+    }
+
+    $DockerDesktopPath = Get-DockerDesktopPath
+    if (-not $DockerDesktopPath) {
+        Write-Error "Docker engine is not running and Docker Desktop could not be found. Start Docker Desktop manually and retry."
+    }
+
+    Start-Process -FilePath $DockerDesktopPath
+}
+
+function Wait-DockerEngineReady {
+    param([int]$TimeoutSeconds = 120)
+
+    if (Test-DockerEngineReady) {
+        return
+    }
+
+    Start-DockerEngine
+    $Deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+
+    while ((Get-Date) -lt $Deadline) {
+        if (Test-DockerEngineReady) {
+            Write-Host "Docker engine is ready." -ForegroundColor Green
+            return
+        }
+        Start-Sleep -Seconds 2
+    }
+
+    Write-Error "Docker Desktop did not become ready within $TimeoutSeconds seconds. Start Docker Desktop manually and retry."
+}
+
 if (-not $InLaunchedTerminal) {
     Start-InExternalTerminal -ScriptPath $PSCommandPath
     Write-Host "Started SWE RL Forge in a new terminal." -ForegroundColor Cyan
@@ -43,6 +120,8 @@ if (-not (Test-CommandExists -Name "forge")) {
 if (-not (Test-CommandExists -Name "npm")) {
     Write-Error "'npm' was not found on PATH. Install Node.js (18+) and retry."
 }
+
+Wait-DockerEngineReady
 
 if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot "frontend\node_modules"))) {
     Write-Host "Installing frontend dependencies..." -ForegroundColor Cyan
