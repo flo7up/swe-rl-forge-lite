@@ -97,8 +97,14 @@ def run_tests_in_docker(
     timeout_seconds: int,
     image_tag_prefix: str,
     dockerfile_path: Path | None = None,
+    exec_command: str | None = None,
 ) -> DockerRunResult:
-    """Build a Docker image from repo_path and run the configured test command."""
+    """Build a Docker image from repo_path and run the configured test command.
+
+    ``exec_command`` overrides the shell command actually run in the container
+    (e.g. a pytest command wrapped to emit a JUnit report); the recorded
+    ``command`` stays ``test_command`` for display.
+    """
 
     started_at = time.monotonic()
     if shutil.which("docker") is None:
@@ -171,7 +177,7 @@ def run_tests_in_docker(
                 duration_seconds=time.monotonic() - started_at,
             )
 
-        run_command = ["docker", "run", "--rm", "--name", container_name, *CONTAINER_RUN_FLAGS, image_tag, "sh", "-lc", test_command]
+        run_command = ["docker", "run", "--rm", "--name", container_name, *CONTAINER_RUN_FLAGS, image_tag, "sh", "-lc", exec_command or test_command]
         try:
             run = subprocess.run(
                 run_command,

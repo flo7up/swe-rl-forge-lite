@@ -384,13 +384,14 @@ Keep `.env` local. It is already ignored by the repository template and should n
 - Applies the gold patch.
 - Runs the configured test command in Docker after the patch.
 - Runs the post-patch command a second time as a deterministic rerun check.
+- For pytest commands, collects a per-test JUnit report from the before/after runs and derives the targeted test sets `fail_to_pass` (failed before, pass after) and `pass_to_pass` (pass both) — the SWE-bench-style scoping spec.
 - Writes `.forge/tasks/<task_id>/verification.json`.
 
 ### `forge package <task_id>`
 
 Creates `taskpacks/<task_id>/` with:
 
-- `task.json`
+- `task.json` (task metadata plus an `eval` block carrying the `fail_to_pass`/`pass_to_pass` test sets)
 - `prompt.md`
 - `gold.patch`
 - `reward.py`
@@ -412,10 +413,10 @@ Runs the taskpack's standalone reward script and returns JSON:
 }
 ```
 
-For v1, the reward is binary:
+The reward is binary:
 
-- `1.0` if the configured test command exits with code `0`
-- `0.0` otherwise
+- If the task has a scoping spec (`eval.fail_to_pass` from a pytest task), the score is `1.0` only when every targeted test passes — all `fail_to_pass` tests pass **and** no `pass_to_pass` test regresses — so unrelated failing or flaky tests in the repo don't mask the signal. The reward re-collects a per-test JUnit report and scores against exactly those node ids.
+- Otherwise (non-pytest tasks, or no spec) it falls back to whole-suite scoring: `1.0` if the configured test command exits with code `0`, else `0.0`.
 
 `error` is `null` on success. On a plain test failure it carries `"Test command exited with code <n>"`; on an infrastructure failure (missing artifacts, Docker build failure, or timeout) it carries the corresponding message.
 
@@ -493,6 +494,7 @@ The configured test command runs inside the container with a timeout, with no ne
 ## Current Limitations
 
 - Python-only Dockerfile generation.
+- Test-scoped reward (`fail_to_pass`/`pass_to_pass`) is derived for pytest commands only; other tasks fall back to whole-suite exit-code scoring. The scoping is computed from the combined gold patch (test files are not yet separated from the fix).
 - No hidden tests or leakage detection.
 - No agent rollout orchestration.
 - No model training, GRPO, LoRA, or fine-tuning pipeline.

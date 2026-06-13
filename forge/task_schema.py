@@ -93,6 +93,8 @@ class VerificationResult(BaseModel):
     docker_build_success: bool = False
     test_environment_success: bool = True
     deterministic_rerun_success: bool = False
+    fail_to_pass: list[str] = Field(default_factory=list)
+    pass_to_pass: list[str] = Field(default_factory=list)
     before_patch: CommandRun | None = None
     after_patch: CommandRun | None = None
     deterministic_rerun: CommandRun | None = None

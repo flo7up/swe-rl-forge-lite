@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 from typing import Callable
@@ -10,6 +11,7 @@ from forge.git_utils import GitCommandError, checkout_clean, clone_or_update, en
 from forge.github_pr import fetch_pr_diff, fetch_pull_request
 from forge.patch_utils import apply_patch_file, check_patch
 from forge.task_schema import CommandRun, TaskMetadata, VerificationResult, detect_test_infrastructure_failure
+from forge.test_report import derive_test_deltas, extract_report, parse_junit_xml, wrap_pytest_command
 
 
 FORGE_DIR = Path(".forge")
@@ -145,6 +147,12 @@ def verify_task(task_id: str, *, root: Path | None = None, log: LogFn = _noop_lo
     before_patch: CommandRun | None = None
     after_patch: CommandRun | None = None
     deterministic_rerun: CommandRun | None = None
+    before_results: dict[str, str] = {}
+    after_results: dict[str, str] = {}
+
+    # Wrap pytest commands to emit a per-test JUnit report; None for non-pytest
+    # commands, which fall back to whole-suite exit-code scoring.
+    exec_command = wrap_pytest_command(metadata.test_command)
 
     try:
         ensure_commit_available(repo_dir, metadata.base_commit)
@@ -174,8 +182,10 @@ def verify_task(task_id: str, *, root: Path | None = None, log: LogFn = _noop_lo
                 metadata.test_command,
                 timeout_seconds=metadata.timeout_seconds,
                 image_tag_prefix=f"forge-{task_id}-before",
+                exec_command=exec_command,
             )
             before_patch = _command_run("before_patch", before)
+            before_results = parse_junit_xml(extract_report(before.stdout))
 
         if base_commit_found and patch_applies:
             log("Applying the gold patch")
@@ -189,8 +199,10 @@ def verify_task(task_id: str, *, root: Path | None = None, log: LogFn = _noop_lo
                     metadata.test_command,
                     timeout_seconds=metadata.timeout_seconds,
                     image_tag_prefix=f"forge-{task_id}-after",
+                    exec_command=exec_command,
                 )
                 after_patch = _command_run("after_patch", after)
+                after_results = parse_junit_xml(extract_report(after.stdout))
 
                 # Attests post-patch idempotence (same patched tree, freshly rebuilt
                 # image, run twice). It does NOT re-check the pre-patch baseline, so a
@@ -201,6 +213,7 @@ def verify_task(task_id: str, *, root: Path | None = None, log: LogFn = _noop_lo
                     metadata.test_command,
                     timeout_seconds=metadata.timeout_seconds,
                     image_tag_prefix=f"forge-{task_id}-rerun",
+                    exec_command=exec_command,
                 )
                 deterministic_rerun = _command_run("deterministic_rerun", rerun)
     finally:
@@ -229,6 +242,13 @@ def verify_task(task_id: str, *, root: Path | None = None, log: LogFn = _noop_lo
     tests_pass_after_patch = after_patch is not None and test_environment_success and after_patch.docker_build_success and after_patch.exit_code == 0
     deterministic_rerun_success = deterministic_rerun is not None and test_environment_success and deterministic_rerun.docker_build_success and deterministic_rerun.exit_code == 0
 
+    # Derive the targeted test sets only when both runs produced a parseable report;
+    # otherwise leave them empty so reward falls back to whole-suite scoring.
+    if before_results and after_results and test_environment_success:
+        fail_to_pass, pass_to_pass = derive_test_deltas(before_results, after_results)
+    else:
+        fail_to_pass, pass_to_pass = [], []
+
     verification = VerificationResult(
         task_id=task_id,
         base_commit_found=base_commit_found,
@@ -238,6 +258,8 @@ def verify_task(task_id: str, *, root: Path | None = None, log: LogFn = _noop_lo
         docker_build_success=docker_build_success,
         test_environment_success=test_environment_success,
         deterministic_rerun_success=deterministic_rerun_success,
+        fail_to_pass=fail_to_pass,
+        pass_to_pass=pass_to_pass,
         before_patch=before_patch,
         after_patch=after_patch,
         deterministic_rerun=deterministic_rerun,
@@ -292,7 +314,16 @@ import subprocess
 import tempfile
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from pathlib import Path
+
+# Sentinels for embedding a JUnit report in container stdout (kept in sync with
+# forge.test_report). Targeted scoring uses the report; otherwise we fall back to
+# the test command's exit code.
+REPORT_PATH = "/tmp/forge-report.xml"
+REPORT_START = "<<<FORGE_JUNIT_START>>>"
+REPORT_END = "<<<FORGE_JUNIT_END>>>"
+_PYTEST_RE = re.compile(r"(^|\s)(pytest|py\.test)(\s|$)|python[0-9.]*\s+-m\s+pytest")
 
 
 def emit(score: float, tests_passed: bool, error: str | None) -> int:
@@ -303,6 +334,55 @@ def emit(score: float, tests_passed: bool, error: str | None) -> int:
 def slug(value: str) -> str:
     normalized = re.sub(r"[^a-zA-Z0-9_.-]+", "-", value).strip("-.").lower()
     return normalized or "task"
+
+
+def is_pytest_command(test_command: str) -> bool:
+    return bool(_PYTEST_RE.search(test_command or ""))
+
+
+def wrap_pytest_command(test_command: str) -> str:
+    inner = f"{test_command} --junitxml={REPORT_PATH}"
+    return (
+        f"{inner}; __forge_code=$?; "
+        f"echo '{REPORT_START}'; cat {REPORT_PATH} 2>/dev/null; echo '{REPORT_END}'; "
+        f"exit $__forge_code"
+    )
+
+
+def extract_report(stdout: str):
+    if not stdout or REPORT_START not in stdout or REPORT_END not in stdout:
+        return None
+    start = stdout.index(REPORT_START) + len(REPORT_START)
+    end = stdout.index(REPORT_END, start)
+    xml = stdout[start:end].strip()
+    return xml or None
+
+
+def parse_junit_xml(xml_text):
+    results = {}
+    if not xml_text:
+        return results
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return results
+    for case in root.iter("testcase"):
+        classname = case.get("classname") or ""
+        name = case.get("name") or ""
+        nodeid = f"{classname}::{name}" if classname else name
+        status = "passed"
+        for child in case:
+            tag = child.tag.lower()
+            if tag in ("failure", "error", "skipped"):
+                status = "failed" if tag == "failure" else tag
+                break
+        results[nodeid] = status
+    return results
+
+
+def score_targeted(results, fail_to_pass, pass_to_pass):
+    ok = {nodeid for nodeid, status in results.items() if status == "passed"}
+    return all(t in ok for t in fail_to_pass) and all(t in ok for t in pass_to_pass)
 
 
 def stage_repo_with_patch(repo_dir: Path, patch_file: Path) -> tuple[Path | None, str | None]:
@@ -367,6 +447,12 @@ def main() -> int:
         image_tag = f"forge-reward-{slug(task['id'])}-{uuid.uuid4().hex[:12]}"
         container_name = f"{image_tag}-run"
 
+        eval_spec = task.get("eval") or {}
+        fail_to_pass = list(eval_spec.get("fail_to_pass") or [])
+        pass_to_pass = list(eval_spec.get("pass_to_pass") or [])
+        scoped = bool(fail_to_pass) and is_pytest_command(test_command)
+        exec_command = wrap_pytest_command(test_command) if scoped else test_command
+
         started_at = time.monotonic()
         try:
             build = subprocess.run(
@@ -390,7 +476,7 @@ def main() -> int:
                     docker_bin, "run", "--rm", "--name", container_name,
                     "--network", "none", "--memory", "4g", "--cpus", "2",
                     "--pids-limit", "512", "--security-opt", "no-new-privileges",
-                    image_tag, "sh", "-lc", test_command,
+                    image_tag, "sh", "-lc", exec_command,
                 ],
                 text=True,
                 encoding="utf-8",
@@ -398,6 +484,15 @@ def main() -> int:
                 capture_output=True,
                 timeout=timeout_seconds,
             )
+            if scoped:
+                results = parse_junit_xml(extract_report(run.stdout))
+                if results:
+                    if score_targeted(results, fail_to_pass, pass_to_pass):
+                        return emit(1.0, True, None)
+                    missing = [t for t in fail_to_pass if results.get(t) != "passed"]
+                    regressed = [t for t in pass_to_pass if results.get(t) != "passed"]
+                    return emit(0.0, False, f"Targeted tests not satisfied (fail_to_pass missing: {len(missing)}, pass_to_pass regressed: {len(regressed)})")
+                # No parseable report (e.g. collection error): fall back to exit code.
             if run.returncode == 0:
                 return emit(1.0, True, None)
             return emit(0.0, False, f"Test command exited with code {run.returncode}")
@@ -415,6 +510,19 @@ def main() -> int:
 if __name__ == "__main__":
     raise SystemExit(main())
 '''
+
+
+def _eval_spec(verification_file: Path) -> dict[str, list[str]]:
+    """Read the targeted test sets from verification.json, robust to partial files."""
+
+    try:
+        data = json.loads(verification_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    return {
+        "fail_to_pass": list(data.get("fail_to_pass") or []),
+        "pass_to_pass": list(data.get("pass_to_pass") or []),
+    }
 
 
 def package_task(task_id: str, *, root: Path | None = None, log: LogFn = _noop_log) -> Path:
@@ -437,7 +545,11 @@ def package_task(task_id: str, *, root: Path | None = None, log: LogFn = _noop_l
     log(f"Checking out base commit {metadata.base_commit} for package snapshot")
     checkout_clean(repo_dir, metadata.base_commit)
 
-    (package_dir / "task.json").write_text(metadata.model_dump_json(indent=2), encoding="utf-8")
+    # The packed task.json is a superset of the metadata: it also carries the eval
+    # spec (targeted test sets) so the standalone reward.py can score without forge.
+    task_payload = json.loads(metadata.model_dump_json())
+    task_payload["eval"] = _eval_spec(verification_file)
+    (package_dir / "task.json").write_text(json.dumps(task_payload, indent=2), encoding="utf-8")
     (package_dir / "prompt.md").write_text(_prompt(metadata), encoding="utf-8")
     (package_dir / "Dockerfile").write_text(generate_python_dockerfile(), encoding="utf-8")
     (package_dir / "reward.py").write_text(_reward_script(), encoding="utf-8")
