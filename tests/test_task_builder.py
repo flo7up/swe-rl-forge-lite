@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -167,6 +168,28 @@ def test_package_task_strips_upstream_dockerignore(tmp_path: Path, monkeypatch: 
 
     assert (package_dir / "repo" / "module.py").exists()
     assert not (package_dir / "repo" / ".dockerignore").exists()
+
+
+def test_package_task_writes_eval_spec_into_task_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    metadata = _metadata()
+    metadata.write_json(metadata_path(tmp_path, metadata.id))
+    gold_patch_path(tmp_path, metadata.id).write_bytes(b"diff --git a b\n")
+    verification_path(tmp_path, metadata.id).write_text(
+        json.dumps({"task_id": metadata.id, "fail_to_pass": ["pkg::test_fix"], "pass_to_pass": ["pkg::test_keep"]}),
+        encoding="utf-8",
+    )
+    repo_dir = tmp_path / ".forge" / "repos" / metadata.id
+    repo_dir.mkdir(parents=True)
+    (repo_dir / "m.py").write_text("value = 1\n", encoding="utf-8")
+    monkeypatch.setattr(task_builder, "checkout_clean", lambda *args, **kwargs: None)
+
+    package_dir = package_task(metadata.id, root=tmp_path)
+
+    task_json = json.loads((package_dir / "task.json").read_text(encoding="utf-8"))
+    assert task_json["eval"] == {"fail_to_pass": ["pkg::test_fix"], "pass_to_pass": ["pkg::test_keep"]}
+    # still a superset of the task metadata
+    assert task_json["test_command"] == metadata.test_command
+    assert task_json["id"] == metadata.id
 
 
 def test_package_task_overwrites_existing_taskpack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

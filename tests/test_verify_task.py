@@ -19,6 +19,24 @@ from forge.patch_utils import PatchResult
 from forge.quality_report import recommend_status
 from forge.task_builder import gold_patch_path, metadata_path, verification_path, verify_task
 from forge.task_schema import TaskMetadata
+from forge.test_report import REPORT_END, REPORT_START
+
+
+def _junit(cases: dict[str, str]) -> str:
+    parts = []
+    for key, status in cases.items():
+        classname, name = key.split("::")
+        body = {"passed": "", "failed": "<failure/>", "skipped": "<skipped/>", "error": "<error/>"}[status]
+        parts.append(f'<testcase classname="{classname}" name="{name}">{body}</testcase>')
+    return "<testsuites><testsuite>" + "".join(parts) + "</testsuite></testsuites>"
+
+
+def _docker_report(exit_code: int, cases: dict[str, str], *, build: bool = True) -> DockerRunResult:
+    stdout = f"collected\n{REPORT_START}\n{_junit(cases)}\n{REPORT_END}\n"
+    return DockerRunResult(
+        command="pytest", exit_code=exit_code, timed_out=False, stdout=stdout, stderr="",
+        error=None, docker_build_success=build, image_tag="img", duration_seconds=1.0,
+    )
 
 
 def _metadata(task_id: str = "ver-001") -> TaskMetadata:
@@ -84,7 +102,7 @@ def _patch_collaborators(
 def _phase_runner(results: dict[str, DockerRunResult]):
     """Dispatch run_tests_in_docker results by the phase encoded in image_tag_prefix."""
 
-    def runner(repo_path, test_command, *, timeout_seconds, image_tag_prefix, dockerfile_path=None):
+    def runner(repo_path, test_command, *, timeout_seconds, image_tag_prefix, dockerfile_path=None, exec_command=None):
         phase = image_tag_prefix.rsplit("-", 1)[-1]
         return results[phase]
 
@@ -185,6 +203,33 @@ def test_verify_nondeterministic_rerun_is_needs_review(tmp_path: Path, monkeypat
     assert result.docker_build_success is True
     assert result.test_environment_success is True
     assert recommend_status(result) == "needs_review"
+
+
+def test_verify_derives_fail_to_pass_and_pass_to_pass(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _setup_task(tmp_path)  # default test_command is "pytest" -> reports are collected
+    before = _docker_report(1, {"pkg::test_keep": "passed", "pkg::test_fix": "failed"})
+    after = _docker_report(0, {"pkg::test_keep": "passed", "pkg::test_fix": "passed"})
+    rerun = _docker_report(0, {"pkg::test_keep": "passed", "pkg::test_fix": "passed"})
+    _patch_collaborators(monkeypatch, runner=_phase_runner({"before": before, "after": after, "rerun": rerun}))
+
+    result = verify_task("ver-001", root=tmp_path)
+
+    assert result.fail_to_pass == ["pkg::test_fix"]
+    assert result.pass_to_pass == ["pkg::test_keep"]
+    assert recommend_status(result) == "usable"
+
+
+def test_verify_leaves_targeted_sets_empty_without_reports(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _setup_task(tmp_path)
+    _patch_collaborators(
+        monkeypatch,
+        runner=_phase_runner({"before": _docker(1), "after": _docker(0), "rerun": _docker(0)}),
+    )
+
+    result = verify_task("ver-001", root=tmp_path)
+
+    assert result.fail_to_pass == []
+    assert result.pass_to_pass == []
 
 
 def test_verify_docker_build_failure_is_invalid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

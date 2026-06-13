@@ -91,6 +91,35 @@ def test_generated_reward_script_is_valid_and_supports_patch() -> None:
     assert "stage_repo_with_patch" in src
 
 
+def test_reward_template_declares_scoped_scoring() -> None:
+    src = _reward_script()
+    assert "score_targeted" in src
+    assert "FORGE_JUNIT_START" in src
+    assert 'task.get("eval")' in src
+
+
+def test_reward_template_scoping_helpers_match_forge() -> None:
+    from forge import test_report as tr
+
+    ns: dict = {}
+    exec(_reward_script(), ns)  # defines helpers; main() only runs under __main__
+
+    xml = '<testsuites><testsuite>' \
+          '<testcase classname="pkg" name="a"></testcase>' \
+          '<testcase classname="pkg" name="b"><failure/></testcase>' \
+          '</testsuite></testsuites>'
+
+    assert ns["parse_junit_xml"](xml) == tr.parse_junit_xml(xml)
+    assert ns["wrap_pytest_command"]("pytest -q") == tr.wrap_pytest_command("pytest -q")
+
+    stdout = f'{ns["REPORT_START"]}{xml}{ns["REPORT_END"]}'
+    assert ns["extract_report"](stdout) == tr.extract_report(stdout)
+
+    # targeted scoring: pass only when every fail_to_pass + pass_to_pass passed
+    assert ns["score_targeted"]({"pkg::a": "passed", "pkg::b": "passed"}, ["pkg::a"], ["pkg::b"]) is True
+    assert ns["score_targeted"]({"pkg::a": "passed", "pkg::b": "failed"}, ["pkg::a"], ["pkg::b"]) is False
+
+
 @requires_git
 def test_good_candidate_patch_applies_then_reaches_docker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     package_dir = _build_taskpack(tmp_path, monkeypatch)
