@@ -270,12 +270,26 @@ Modify the code so that the tests pass.
 
 def _reward_script() -> str:
     return r'''#!/usr/bin/env python3
+"""Standalone, self-contained reward for this task.
+
+Usage:
+  python reward.py                     score the base repo snapshot as-is
+  python reward.py --patch fix.diff    apply a candidate fix, then score
+
+The candidate patch is applied (git apply) onto a throwaway copy of repo/, so the
+base snapshot is never mutated and reruns stay independent. Emits one JSON line:
+{"score": 0.0|1.0, "tests_passed": bool, "error": str|null}. Set FORGE_DOCKER_BIN
+to use a different container engine (e.g. podman).
+"""
 from __future__ import annotations
 
+import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -291,7 +305,36 @@ def slug(value: str) -> str:
     return normalized or "task"
 
 
+def stage_repo_with_patch(repo_dir: Path, patch_file: Path) -> tuple[Path | None, str | None]:
+    """Copy repo_dir into a temp dir and apply the candidate patch. Returns (work_dir, error)."""
+
+    if not patch_file.exists():
+        return None, f"Candidate patch not found: {patch_file}"
+    if shutil.which("git") is None:
+        return None, "git executable not found on PATH (required to apply --patch)"
+    stage_root = Path(tempfile.mkdtemp(prefix="forge-reward-stage-"))
+    work = stage_root / "repo"
+    shutil.copytree(repo_dir, work)
+    applied = subprocess.run(
+        ["git", "apply", "--whitespace=nowarn", str(patch_file)],
+        cwd=work,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+    )
+    if applied.returncode != 0:
+        shutil.rmtree(stage_root, ignore_errors=True)
+        detail = (applied.stderr or applied.stdout).strip()[-500:]
+        return None, f"Candidate patch did not apply: {detail}"
+    return work, None
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Score a candidate fix against this task's tests.")
+    parser.add_argument("--patch", type=Path, default=None, help="Unified diff with the candidate fix to apply before testing.")
+    args = parser.parse_args()
+
     package_dir = Path(__file__).resolve().parent
     task_path = package_dir / "task.json"
     repo_dir = package_dir / "repo"
@@ -303,55 +346,70 @@ def main() -> int:
         return emit(0.0, False, f"Missing repository directory: {repo_dir}")
     if not dockerfile.exists():
         return emit(0.0, False, f"Missing Dockerfile: {dockerfile}")
-    if shutil.which("docker") is None:
-        return emit(0.0, False, "Docker executable not found on PATH")
 
-    task = json.loads(task_path.read_text(encoding="utf-8"))
-    test_command = task["test_command"]
-    timeout_seconds = int(task.get("timeout_seconds", 300))
-    image_tag = f"forge-reward-{slug(task['id'])}-{uuid.uuid4().hex[:12]}"
-    container_name = f"{image_tag}-run"
-
-    started_at = time.monotonic()
-    try:
-        build = subprocess.run(
-            ["docker", "build", "--file", str(dockerfile), "--tag", image_tag, str(repo_dir)],
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            capture_output=True,
-            timeout=max(120, timeout_seconds * 2),
-        )
-    except subprocess.TimeoutExpired:
-        return emit(0.0, False, "Docker build timed out")
-
-    if build.returncode != 0:
-        detail = (build.stderr or build.stdout).strip()[-1000:]
-        return emit(0.0, False, f"Docker build failed with code {build.returncode}: {detail}")
+    build_context = repo_dir
+    stage_root: Path | None = None
+    if args.patch is not None:
+        staged, error = stage_repo_with_patch(repo_dir, args.patch.resolve())
+        if error is not None:
+            return emit(0.0, False, error)
+        build_context = staged
+        stage_root = staged.parent
 
     try:
-        run = subprocess.run(
-            [
-                "docker", "run", "--rm", "--name", container_name,
-                "--network", "none", "--memory", "4g", "--cpus", "2",
-                "--pids-limit", "512", "--security-opt", "no-new-privileges",
-                image_tag, "sh", "-lc", test_command,
-            ],
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            capture_output=True,
-            timeout=timeout_seconds,
-        )
-        if run.returncode == 0:
-            return emit(1.0, True, None)
-        return emit(0.0, False, f"Test command exited with code {run.returncode}")
-    except subprocess.TimeoutExpired:
-        subprocess.run(["docker", "rm", "-f", container_name], text=True, encoding="utf-8", errors="replace", capture_output=True)
-        elapsed = round(time.monotonic() - started_at, 2)
-        return emit(0.0, False, f"Test command timed out after {timeout_seconds} seconds ({elapsed}s elapsed)")
+        docker_bin = os.environ.get("FORGE_DOCKER_BIN", "docker")
+        if shutil.which(docker_bin) is None:
+            return emit(0.0, False, f"Docker executable not found on PATH: {docker_bin}")
+
+        task = json.loads(task_path.read_text(encoding="utf-8"))
+        test_command = task["test_command"]
+        timeout_seconds = int(task.get("timeout_seconds", 300))
+        image_tag = f"forge-reward-{slug(task['id'])}-{uuid.uuid4().hex[:12]}"
+        container_name = f"{image_tag}-run"
+
+        started_at = time.monotonic()
+        try:
+            build = subprocess.run(
+                [docker_bin, "build", "--file", str(dockerfile), "--tag", image_tag, str(build_context)],
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                timeout=max(120, timeout_seconds * 2),
+            )
+        except subprocess.TimeoutExpired:
+            return emit(0.0, False, "Docker build timed out")
+
+        if build.returncode != 0:
+            detail = (build.stderr or build.stdout).strip()[-1000:]
+            return emit(0.0, False, f"Docker build failed with code {build.returncode}: {detail}")
+
+        try:
+            run = subprocess.run(
+                [
+                    docker_bin, "run", "--rm", "--name", container_name,
+                    "--network", "none", "--memory", "4g", "--cpus", "2",
+                    "--pids-limit", "512", "--security-opt", "no-new-privileges",
+                    image_tag, "sh", "-lc", test_command,
+                ],
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                timeout=timeout_seconds,
+            )
+            if run.returncode == 0:
+                return emit(1.0, True, None)
+            return emit(0.0, False, f"Test command exited with code {run.returncode}")
+        except subprocess.TimeoutExpired:
+            subprocess.run([docker_bin, "rm", "-f", container_name], text=True, encoding="utf-8", errors="replace", capture_output=True)
+            elapsed = round(time.monotonic() - started_at, 2)
+            return emit(0.0, False, f"Test command timed out after {timeout_seconds} seconds ({elapsed}s elapsed)")
+        finally:
+            subprocess.run([docker_bin, "image", "rm", "-f", image_tag], text=True, encoding="utf-8", errors="replace", capture_output=True)
     finally:
-        subprocess.run(["docker", "image", "rm", "-f", image_tag], text=True, encoding="utf-8", errors="replace", capture_output=True)
+        if stage_root is not None:
+            shutil.rmtree(stage_root, ignore_errors=True)
 
 
 if __name__ == "__main__":

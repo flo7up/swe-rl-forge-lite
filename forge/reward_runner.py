@@ -43,7 +43,7 @@ def _reward_timeout_seconds(taskpack_path: Path) -> int:
     return max(120, configured) * 3 + 120
 
 
-def run_reward_script(taskpack_path: Path, *, timeout_seconds: float | None = None) -> RewardResult:
+def run_reward_script(taskpack_path: Path, *, patch_path: Path | None = None, timeout_seconds: float | None = None) -> RewardResult:
     """Run a taskpack's standalone reward.py and parse its JSON output."""
 
     taskpack_path = taskpack_path.resolve()
@@ -51,10 +51,14 @@ def run_reward_script(taskpack_path: Path, *, timeout_seconds: float | None = No
     if not reward_script.exists():
         return RewardResult(score=0.0, tests_passed=False, error=f"Missing reward script: {reward_script}")
 
+    argv = [sys.executable, str(reward_script)]
+    if patch_path is not None:
+        argv += ["--patch", str(Path(patch_path).resolve())]
+
     timeout = timeout_seconds if timeout_seconds is not None else _reward_timeout_seconds(taskpack_path)
     try:
         completed = subprocess.run(
-            [sys.executable, str(reward_script)],
+            argv,
             cwd=taskpack_path,
             text=True,
             encoding="utf-8",

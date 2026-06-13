@@ -166,10 +166,20 @@ def package_command(task_id: str = typer.Argument(..., help="Task id to package.
 
 
 @app.command("reward")
-def reward_command(taskpack_path: Path = typer.Argument(..., exists=True, file_okay=False, readable=True, help="Path to a taskpack directory.")) -> None:
+def reward_command(
+    taskpack_path: Path = typer.Argument(..., exists=True, file_okay=False, readable=True, help="Path to a taskpack directory."),
+    patch: Path | None = typer.Option(
+        None,
+        "--patch",
+        exists=True,
+        dir_okay=False,
+        readable=True,
+        help="Candidate fix (unified diff) to apply onto a copy of repo/ before scoring.",
+    ),
+) -> None:
     """Run a taskpack reward script and print JSON."""
 
-    result = run_reward_script(taskpack_path)
+    result = run_reward_script(taskpack_path, patch_path=patch)
     print(json.dumps(result.model_dump(), indent=2))
 
 
