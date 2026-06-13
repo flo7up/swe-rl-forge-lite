@@ -63,7 +63,7 @@ The React dashboard is a near real-time observer of the pipeline. From top to bo
 
 ![Forge live dashboard pipeline controls](docs/images/live-dashboard-controls.png)
 
-Pipeline controls are opt-in on the CLI via `--enable-controls`. They only run named forge operations (`fetch`, `verify`, and `package`) against local task data; they do not expose arbitrary shell command execution. By default the dashboard is read-only and refresh-safe.
+Pipeline controls are opt-in on the CLI via `--enable-controls`. The server itself only runs named forge operations (`fetch`, `verify`, and `package`) against local task data — it never shells out to arbitrary commands on the host. A task's configured `test_command` is executed only inside the disposable, network-isolated Docker container, never on the host shell. Control endpoints additionally accept requests only from loopback (localhost) origins, which blocks cross-site and DNS-rebinding abuse from a page you happen to be visiting. By default the dashboard is read-only and refresh-safe.
 
 ## Project Flow
 
@@ -91,7 +91,7 @@ For each candidate task, `forge verify` checks:
 - The historical gold patch applies cleanly on that base commit.
 - Tests fail before the patch.
 - Tests pass after the patch.
-- A deterministic post-patch rerun also passes.
+- A deterministic post-patch rerun also passes (it re-runs the patched tree in a freshly built image to catch post-patch flakiness; it does not re-check the pre-patch baseline).
 - Docker builds and the test environment are healthy.
 
 The verifier also distinguishes product behavior from infrastructure failures (for example, missing test tooling or Docker build issues), and records those separately in verification output.
@@ -271,7 +271,7 @@ forge explore --limit 10 --output .forge/candidates.yaml
 
 Useful options:
 
-- `--query "is:pr is:merged language:Python pytest regression"` to control GitHub search.
+- `--query "is:pr is:merged language:Python pytest regression"` to control GitHub search (the default when omitted is `is:pr is:merged language:Python pytest fix`).
 - `--test-command "pytest"` to set the generated task command.
 - `--timeout-seconds 300` to set the generated timeout.
 
@@ -406,8 +406,8 @@ Runs the taskpack's standalone reward script and returns JSON:
 
 ```json
 {
-  "score": 0.0,
-  "tests_passed": false,
+  "score": 1.0,
+  "tests_passed": true,
   "error": null
 }
 ```
@@ -416,6 +416,8 @@ For v1, the reward is binary:
 
 - `1.0` if the configured test command exits with code `0`
 - `0.0` otherwise
+
+`error` is `null` on success. On a plain test failure it carries `"Test command exited with code <n>"`; on an infrastructure failure (missing artifacts, Docker build failure, or timeout) it carries the corresponding message.
 
 ### `forge report <task_id>`
 
@@ -468,17 +470,17 @@ With controls enabled:
 - Only one control job can run at a time.
 - Invalid verification results are not packaged.
 
-Controls deliberately run named forge operations rather than arbitrary shell commands. Auto mode is a bounded batch run, not a continuous scheduler.
+Controls deliberately run named forge operations rather than arbitrary host shell commands; the task `test_command` runs only inside the Docker container. Control endpoints accept requests only from loopback origins. Auto mode is a bounded batch run, not a continuous scheduler.
 
 ## Docker Execution
 
-Generated task Dockerfiles use `python:3.11-slim` and this install order:
+Generated task Dockerfiles use `python:3.11-slim`. The image always upgrades `pip` and installs `pytest`, then installs the project with the **first** rule that matches:
 
-1. `pip install -e .` if `pyproject.toml`, `setup.py`, or `setup.cfg` exists
-2. `pip install -r requirements.txt` if `requirements.txt` exists
-3. no install step if neither exists
+1. `pip install -e .` if `pyproject.toml`, `setup.py`, or `setup.cfg` exists, otherwise
+2. `pip install -r requirements.txt` if `requirements.txt` exists, otherwise
+3. no project install step.
 
-The configured test command is run with a timeout. Docker is deliberately local-only; there is no cloud dependency.
+The configured test command runs inside the container with a timeout, with no network access and bounded resources (`--network none`, `--memory`, `--cpus`, `--pids-limit`, `--security-opt no-new-privileges`). Tests that need network access at run time will therefore fail — this is intentional, since network-dependent tests are not reproducible. Docker is deliberately local-only; there is no cloud dependency.
 
 ## Current Limitations
 

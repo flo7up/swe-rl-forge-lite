@@ -12,7 +12,8 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import unquote, urlparse
+import ipaddress
+from urllib.parse import unquote, urlparse, urlsplit
 
 from forge.dashboard import DashboardTask, collect_dashboard_tasks
 from forge.quality_report import recommend_status
@@ -24,6 +25,57 @@ DEFAULT_FRONTEND_DIST = Path("frontend") / "dist"
 DEFAULT_CONTROL_CONFIG = Path("examples") / "tasks.yaml"
 
 _CONTROL_TASK_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_LOCAL_HOSTNAMES = {"localhost", "127.0.0.1", "::1"}
+
+
+def _host_is_local(hostname: str) -> bool:
+    host = (hostname or "").strip().strip("[]").lower()
+    if not host:
+        return False
+    if host in _LOCAL_HOSTNAMES:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _hostname_from_authority(authority: str | None) -> str:
+    """Extract the host from a ``Host`` header value like ``127.0.0.1:8765`` or ``[::1]:8765``."""
+
+    if not authority:
+        return ""
+    return urlsplit("//" + authority).hostname or ""
+
+
+def _hostname_from_origin(origin: str | None) -> str:
+    if not origin:
+        return ""
+    return urlsplit(origin).hostname or ""
+
+
+def _control_request_allowed(host_header: str | None, origin: str | None) -> bool:
+    """Allow control requests only from a loopback Host and (if sent) a loopback Origin.
+
+    The control endpoints spawn Docker jobs, so they are state-changing. Validating
+    the ``Host`` header defeats DNS-rebinding (an attacker domain pointed at
+    127.0.0.1 still sends its own host), and rejecting a non-local ``Origin`` defeats
+    cross-site POSTs from a page the user happens to be visiting.
+    """
+
+    if not _host_is_local(_hostname_from_authority(host_header)):
+        return False
+    if origin and not _host_is_local(_hostname_from_origin(origin)):
+        return False
+    return True
+
+
+def _cors_origin_for(origin: str | None) -> str | None:
+    """Return the request Origin to echo back, but only when it is loopback."""
+
+    if origin and _host_is_local(_hostname_from_origin(origin)):
+        return origin
+    return None
 
 
 class ControlBusyError(RuntimeError):
@@ -323,15 +375,27 @@ def serve_live_dashboard(
 
         def do_OPTIONS(self) -> None:  # noqa: N802 - required http.server method name
             self.send_response(HTTPStatus.NO_CONTENT)
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self._send_cors_headers()
             self.end_headers()
+
+        def _send_cors_headers(self) -> None:
+            cors = _cors_origin_for(self.headers.get("Origin"))
+            if cors is not None:
+                self.send_header("Access-Control-Allow-Origin", cors)
+                self.send_header("Vary", "Origin")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
         def _handle_control(self, mode: str) -> None:
             if runner is None:
                 self._write_json(
                     {"enabled": False, "error": "Controls are disabled. Restart dashboard-live with --enable-controls."},
+                    status=HTTPStatus.FORBIDDEN,
+                )
+                return
+            if not _control_request_allowed(self.headers.get("Host"), self.headers.get("Origin")):
+                self._write_json(
+                    {"enabled": True, "error": "Control requests must originate from localhost."},
                     status=HTTPStatus.FORBIDDEN,
                 )
                 return
@@ -396,9 +460,7 @@ def serve_live_dashboard(
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self._send_cors_headers()
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
