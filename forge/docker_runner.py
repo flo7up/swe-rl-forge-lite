@@ -1,13 +1,50 @@
 from __future__ import annotations
 
+import contextlib
 import re
 import shutil
 import subprocess
 import tempfile
 import time
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+
+
+# Hardening for the test-execution container. The repo and its test command are
+# untrusted third-party code, so the run gets no network and bounded resources.
+# (The build keeps network access because pip needs it.)
+CONTAINER_RUN_FLAGS = [
+    "--network", "none",
+    "--memory", "4g",
+    "--cpus", "2",
+    "--pids-limit", "512",
+    "--security-opt", "no-new-privileges",
+]
+
+
+@contextlib.contextmanager
+def _without_repo_dockerignore(repo_path: Path) -> Iterator[None]:
+    """Temporarily hide a repo's own ``.dockerignore`` for the duration of a build.
+
+    Forge builds with its own generated Dockerfile (``COPY . /workspace``). An
+    upstream ``.dockerignore`` would silently exclude files the tests rely on, so
+    the verifier would build a different tree than the packaged snapshot. Restored
+    on exit so the cloned repo is left untouched.
+    """
+
+    dockerignore = repo_path / ".dockerignore"
+    backup = repo_path / ".dockerignore.forge-disabled"
+    moved = False
+    if dockerignore.is_file() and not backup.exists():
+        dockerignore.rename(backup)
+        moved = True
+    try:
+        yield
+    finally:
+        if moved:
+            backup.rename(dockerignore)
 
 
 @dataclass(frozen=True)
@@ -93,7 +130,7 @@ def run_tests_in_docker(
     image_tag = f"{_slug(image_tag_prefix)}-{uuid.uuid4().hex[:12]}"
     container_name = f"{image_tag}-run"
 
-    with tempfile.TemporaryDirectory(prefix="forge-docker-") as temp_dir:
+    with _without_repo_dockerignore(repo_path), tempfile.TemporaryDirectory(prefix="forge-docker-") as temp_dir:
         dockerfile = dockerfile_path or Path(temp_dir) / "Dockerfile"
         if dockerfile_path is None:
             write_python_dockerfile(dockerfile)
@@ -134,7 +171,7 @@ def run_tests_in_docker(
                 duration_seconds=time.monotonic() - started_at,
             )
 
-        run_command = ["docker", "run", "--rm", "--name", container_name, image_tag, "sh", "-lc", test_command]
+        run_command = ["docker", "run", "--rm", "--name", container_name, *CONTAINER_RUN_FLAGS, image_tag, "sh", "-lc", test_command]
         try:
             run = subprocess.run(
                 run_command,

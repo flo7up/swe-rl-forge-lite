@@ -2,8 +2,33 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from forge.dashboard_live import DashboardControlRunner, build_dashboard_snapshot
+from forge.dashboard_live import (
+    DashboardControlRunner,
+    _control_request_allowed,
+    _cors_origin_for,
+    build_dashboard_snapshot,
+)
 from forge.task_schema import CommandRun, TaskMetadata, VerificationResult
+
+
+def test_control_request_allowed_for_localhost() -> None:
+    assert _control_request_allowed("127.0.0.1:8765", None)
+    assert _control_request_allowed("localhost:8765", "http://localhost:5173")
+    assert _control_request_allowed("[::1]:8765", None)
+
+
+def test_control_request_rejects_cross_site_and_dns_rebinding() -> None:
+    assert not _control_request_allowed("127.0.0.1:8765", "http://evil.example")  # CSRF
+    assert not _control_request_allowed("evil.example", "http://evil.example")    # DNS rebinding
+    assert not _control_request_allowed("192.168.1.10:8765", None)                # LAN host
+    assert not _control_request_allowed("", None)
+
+
+def test_cors_origin_reflects_local_only() -> None:
+    assert _cors_origin_for("http://localhost:5173") == "http://localhost:5173"
+    assert _cors_origin_for("http://127.0.0.1:8765") == "http://127.0.0.1:8765"
+    assert _cors_origin_for("http://evil.example") is None
+    assert _cors_origin_for(None) is None
 
 
 def test_build_dashboard_snapshot_includes_summary_and_tasks(tmp_path: Path) -> None:

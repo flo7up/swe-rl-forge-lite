@@ -24,6 +24,18 @@ def _noop_log(_: str) -> None:
     return None
 
 
+def write_gold_patch(path: Path, diff: str) -> None:
+    """Persist a unified diff verbatim as UTF-8 bytes.
+
+    ``Path.write_text`` uses text mode, which on Windows rewrites every ``\\n`` to
+    ``\\r\\n``. ``git apply --check`` then rejects the otherwise-valid patch, so a
+    correct historical fix is silently recorded as non-applying. Writing bytes
+    keeps the diff's original line endings intact on every platform.
+    """
+
+    path.write_bytes(diff.encode("utf-8"))
+
+
 def _repo_dir(root: Path, task_id: str) -> Path:
     return root / REPOS_DIR / task_id
 
@@ -87,7 +99,7 @@ def fetch_task(task: TaskConfig, *, root: Path | None = None, log: LogFn = _noop
 
     log("Downloading PR diff")
     diff = fetch_pr_diff(task.repo_url, task.pr_number)
-    gold_patch_path(root, task.id).write_text(diff, encoding="utf-8")
+    write_gold_patch(gold_patch_path(root, task.id), diff)
 
     metadata = TaskMetadata(
         id=task.id,
@@ -180,6 +192,9 @@ def verify_task(task_id: str, *, root: Path | None = None, log: LogFn = _noop_lo
                 )
                 after_patch = _command_run("after_patch", after)
 
+                # Attests post-patch idempotence (same patched tree, freshly rebuilt
+                # image, run twice). It does NOT re-check the pre-patch baseline, so a
+                # flaky *before* state is not caught here.
                 log("Running deterministic post-patch rerun")
                 rerun = run_tests_in_docker(
                     repo_dir,
@@ -316,7 +331,12 @@ def main() -> int:
 
     try:
         run = subprocess.run(
-            ["docker", "run", "--rm", "--name", container_name, image_tag, "sh", "-lc", test_command],
+            [
+                "docker", "run", "--rm", "--name", container_name,
+                "--network", "none", "--memory", "4g", "--cpus", "2",
+                "--pids-limit", "512", "--security-opt", "no-new-privileges",
+                image_tag, "sh", "-lc", test_command,
+            ],
             text=True,
             encoding="utf-8",
             errors="replace",
@@ -372,6 +392,10 @@ def package_task(task_id: str, *, root: Path | None = None, log: LogFn = _noop_l
         package_dir / "repo",
         ignore=shutil.ignore_patterns(
             ".git",
+            # Forge builds with its own generated Dockerfile (COPY . /workspace); an
+            # upstream .dockerignore would silently drop files the tests need, so the
+            # reward image would test a different tree than this snapshot. Strip it.
+            ".dockerignore",
             "__pycache__",
             ".pytest_cache",
             ".mypy_cache",

@@ -14,6 +14,7 @@ from forge.task_builder import (
     metadata_path,
     package_task,
     verification_path,
+    write_gold_patch,
 )
 from forge.task_schema import TaskMetadata
 
@@ -137,6 +138,35 @@ def test_package_task_builds_taskpack(tmp_path: Path, monkeypatch: pytest.Monkey
     assert (package_dir / "verification.json").exists()
     assert (package_dir / "repo" / "module.py").exists()
     assert not (package_dir / "repo" / ".git").exists()
+
+
+def test_write_gold_patch_preserves_lf_line_endings(tmp_path: Path) -> None:
+    path = tmp_path / "gold.patch"
+
+    write_gold_patch(path, "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n+line\n")
+
+    raw = path.read_bytes()
+    assert b"\r\n" not in raw
+    assert raw.endswith(b"+line\n")
+
+
+def test_package_task_strips_upstream_dockerignore(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    metadata = _metadata()
+    metadata.write_json(metadata_path(tmp_path, metadata.id))
+    gold_patch_path(tmp_path, metadata.id).write_text("diff --git a b\n", encoding="utf-8")
+    verification_path(tmp_path, metadata.id).write_text("{}", encoding="utf-8")
+
+    repo_dir = tmp_path / ".forge" / "repos" / metadata.id
+    repo_dir.mkdir(parents=True)
+    (repo_dir / "module.py").write_text("value = 1\n", encoding="utf-8")
+    (repo_dir / ".dockerignore").write_text("tests/\n", encoding="utf-8")
+
+    monkeypatch.setattr(task_builder, "checkout_clean", lambda *args, **kwargs: None)
+
+    package_dir = package_task(metadata.id, root=tmp_path)
+
+    assert (package_dir / "repo" / "module.py").exists()
+    assert not (package_dir / "repo" / ".dockerignore").exists()
 
 
 def test_package_task_overwrites_existing_taskpack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
