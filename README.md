@@ -419,6 +419,14 @@ For v1, the reward is binary:
 
 `error` is `null` on success. On a plain test failure it carries `"Test command exited with code <n>"`; on an infrastructure failure (missing artifacts, Docker build failure, or timeout) it carries the corresponding message.
 
+To score an agent's candidate fix, pass it as a unified diff:
+
+```bash
+forge reward taskpacks/click-pr-001 --patch candidate.diff
+```
+
+The patch is applied with `git apply` onto a throwaway copy of the packaged `repo/` — the base snapshot is never mutated — then the image is rebuilt from the patched copy and the tests run inside the container. If the candidate patch does not apply, the reward is `0.0` with an explanatory `error`. Without `--patch`, the base snapshot is scored as-is, which is `0.0` by construction for a real bug-fix task. Set `FORGE_DOCKER_BIN` to use a different container engine (for example `podman`).
+
 ### `forge report <task_id>`
 
 Prints a compact quality report:
